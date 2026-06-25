@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Android SDK
         if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false'}}
