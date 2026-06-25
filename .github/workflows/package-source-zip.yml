@@ -1,0 +1,34 @@
+name: Package Source Zip (app.zip)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package_source_zip:
+    name: Zipped code source (app.zip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create app.zip (exclude git metadata)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f app.zip
+          zip -r app.zip . -x ".git/*" ".git/**"
+
+      - name: Upload app.zip artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-zip
+          path: app.zip
+          if-no-files-found: error

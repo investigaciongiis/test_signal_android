@@ -1,0 +1,151 @@
+---
+name: mSEC-AT audit pipeline orchestrator
+
+on:
+  push:
+    branches: [ main ]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  security-events: write
+  packages: read
+
+concurrency:
+  # One active run per PR number (pull_request), or per branch name (push/workflow_dispatch).
+  # Cancel older runs ONLY on pushes (e.g., main).
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  # 0) Computes execution gates (Dependabot + fork PR) to make the pipeline fail-safe and DRY
+  gate:
+    name: Gate (Dependabot + fork PR)
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      run_phase1: ${{ steps.gate.outputs.run_phase1 }}
+      run_phase2: ${{ steps.gate.outputs.run_phase2 }}
+      is_dependabot: ${{ steps.gate.outputs.is_dependabot }}
+      is_fork_pr: ${{ steps.gate.outputs.is_fork_pr }}
+    steps:
+      - id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_dependabot="false"
+          if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+            is_dependabot="true"
+          fi
+          if [[ "${{ github.ref_name }}" == dependabot/* ]]; then
+            is_dependabot="true"
+          fi
+          if [[ "${{ github.head_ref }}" == dependabot/* ]]; then
+            is_dependabot="true"
+          fi
+
+          is_fork_pr="false"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+              is_fork_pr="true"
+            fi
+          fi
+
+          run_phase1="true"
+          run_phase2="true"
+
+          if [[ "$is_dependabot" == "true" ]]; then
+            run_phase1="false"
+            run_phase2="false"
+          fi
+
+          if [[ "$is_fork_pr" == "true" ]]; then
+            run_phase2="false"
+          fi
+
+          echo "is_dependabot=$is_dependabot" >> "$GITHUB_OUTPUT"
+          echo "is_fork_pr=$is_fork_pr"       >> "$GITHUB_OUTPUT"
+          echo "run_phase1=$run_phase1"       >> "$GITHUB_OUTPUT"
+          echo "run_phase2=$run_phase2"       >> "$GITHUB_OUTPUT"
+
+  # ---- PHASE 1: PARALLEL (security + packaging prerequisites) ----
+
+  # 1) Runs CodeQL analysis (static code scanning) and uploads security findings
+  codeql_analysis:
+    needs: [gate]
+    if: ${{ needs.gate.outputs.run_phase1 == 'true' }}
+    uses: ./.github/workflows/codeql-analysis.yml
+    secrets: inherit
+
+  # 2) Runs additional security scanners (SAST/SCA/container/etc.) and publishes artifacts/reports
+  security_scans:
+    needs: [gate]
+    if: ${{ needs.gate.outputs.run_phase1 == 'true' }}
+    uses: ./.github/workflows/security-scans.yml
+    secrets: inherit
+
+  # 3) Runs Mobile Security Framework (MobSF) scan and uploads MobSF JSON reports (trusted only)
+  mobsf:
+    needs: [gate]
+    if: ${{ needs.gate.outputs.run_phase2 == 'true' }}
+    uses: ./.github/workflows/mobsf.yml
+    secrets: inherit
+
+  # 4) Packages repository source code into app.zip and uploads it as an artifact (input for fingerprinting)
+  package_source_zip:
+    needs: [gate]
+    if: ${{ needs.gate.outputs.run_phase1 == 'true' }}
+    uses: ./.github/workflows/package-source-zip.yml
+    secrets: inherit
+
+  # ---- PHASE 2: SERIAL (fingerprint -> requirements Excel -> final report) ----
+
+  # 5) Generates the VISION360 fingerprint and bundle from all upstream artifacts
+  vision360_generator:
+    needs: [gate, codeql_analysis, security_scans, mobsf, package_source_zip]
+    if: >-
+      ${{
+        needs.gate.outputs.run_phase2 == 'true' &&
+        needs.codeql_analysis.result == 'success' &&
+        needs.security_scans.result == 'success' &&
+        needs.mobsf.result == 'success' &&
+        needs.package_source_zip.result == 'success'
+      }}
+    uses: ./.github/workflows/vision360-generator.yml
+    secrets: inherit
+
+  # 6) Generates the AI-driven security requirements audit Excel from the fingerprint
+  ai_requirements_excel:
+    needs: [gate, vision360_generator]
+    if: >-
+      ${{
+        needs.gate.outputs.run_phase2 == 'true' &&
+        needs.vision360_generator.result == 'success'
+      }}
+    uses: ./.github/workflows/ai-requirements-excel.yml
+    secrets: inherit
+
+  # 7) Generates the final Audit Summary deliverable (Stage 1 JSON + Stage 2 DOCX)
+  audit_summary:
+    needs: [gate, ai_requirements_excel]
+    if: >-
+      ${{
+        needs.gate.outputs.run_phase2 == 'true' &&
+        needs.ai_requirements_excel.result == 'success'
+      }}
+    uses: ./.github/workflows/audit-summary.yml
+    secrets: inherit
+
+  # 8) No-op job for Dependabot (keeps required checks green while skipping heavy pipeline)
+  noop:
+    needs: [gate]
+    if: ${{ needs.gate.outputs.is_dependabot == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: "printf '%s\n' 'Dependabot detected: skipping pipeline (noop).'"
+      

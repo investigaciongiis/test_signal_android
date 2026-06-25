@@ -1,0 +1,333 @@
+name: Mobile Security Scan
+
+on:
+  workflow_call:
+
+concurrency:
+  group: mobsf-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  mobsf_scan:
+    runs-on: self-hosted
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEYSTORE_ALIAS_NAME: ${{ secrets.KEYSTORE_ALIAS_NAME }}
+      KEYSTORE_ALIAS_PASS: ${{ secrets.KEYSTORE_ALIAS_PASS }}
+      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+      MOBSF_BASE_URL: ${{ vars.MOBSF_BASE_URL }}
+      MOBSF_DELETE_BEFORE_SCAN: ${{ vars.MOBSF_DELETE_BEFORE_SCAN }}
+      MOBSF_DELETE_ENDPOINT: ${{ vars.MOBSF_DELETE_ENDPOINT }}
+      USE_PREBUILT_APK: ${{ vars.USE_PREBUILT_APK }}
+      PREBUILT_APK_PATH: ${{ vars.PREBUILT_APK_PATH }}
+
+    steps:
+
+      - name: Enable Git long paths
+        shell: powershell
+        run: |
+          git config --global core.longpaths true
+          git config --global --get core.longpaths
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Detect Gradle version
+        id: gradle
+        shell: powershell
+        run: |
+          $version = "unknown"
+
+          if (Test-Path "gradle\wrapper\gradle-wrapper.properties") {
+            $content = Get-Content "gradle\wrapper\gradle-wrapper.properties"
+            $line = $content | Select-String "distributionUrl"
+            if ($line) {
+              $m = [regex]::Match($line.ToString(), 'gradle-([0-9.]+)-')
+              if ($m.Success) {
+                $version = $m.Groups[1].Value
+              }
+            }
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Detected Gradle version: $version"
+
+      - name: Set up JDK 8 for legacy Gradle
+        if: ${{ startsWith(steps.gradle.outputs.version, '2.') || startsWith(steps.gradle.outputs.version, '3.') || startsWith(steps.gradle.outputs.version, '4.') }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Set up JDK for modern Gradle
+        if: ${{ !(startsWith(steps.gradle.outputs.version, '2.') || startsWith(steps.gradle.outputs.version, '3.') || startsWith(steps.gradle.outputs.version, '4.')) }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ vars.JAVA_VERSION || '11' }}
+
+      - name: Decode keystore
+        if: ${{ vars.USE_PREBUILT_APK != 'true' }}
+        shell: powershell
+        run: |
+          $bytes = [System.Convert]::FromBase64String("${{ secrets.ANDROID_KEYSTORE_BASE64 }}")
+          [System.IO.File]::WriteAllBytes("$env:GITHUB_WORKSPACE\release.keystore", $bytes)
+
+      - name: Build Android app
+        id: build_app
+        if: ${{ vars.USE_PREBUILT_APK != 'true' }}
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $cmd = "${{ vars.ANDROID_BUILD_CMD }}"
+
+          if ([string]::IsNullOrWhiteSpace($cmd)) {
+            $cmd = ".\gradlew.bat --no-daemon clean assembleRelease"
+          }
+
+          Write-Host "Running build command: $cmd"
+          Invoke-Expression $cmd
+
+      - name: Validate prebuilt APK
+        if: ${{ vars.USE_PREBUILT_APK == 'true' }}
+        shell: powershell
+        run: |
+          $apkPath = "$env:PREBUILT_APK_PATH"
+          if ([string]::IsNullOrWhiteSpace($apkPath)) {
+            $apkPath = "apk/app-release.apk"
+            Write-Host "PREBUILT_APK_PATH not set. Using default: $apkPath"
+          }
+
+          if (-not (Test-Path $apkPath)) {
+            Write-Error "Prebuilt APK not found at: $apkPath"
+            exit 1
+          }
+
+          "RESOLVED_APK_PATH=$apkPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Using prebuilt APK: $apkPath"
+
+      - name: Report build outcome
+        if: ${{ vars.USE_PREBUILT_APK != 'true' && steps.build_app.outcome == 'failure' }}
+        shell: powershell
+        run: |
+          Write-Host 'assembleRelease failed. The workflow will try to use a trusted APK from the repository folder apk/.'
+
+      - name: Locate APK
+        id: locate_apk
+        shell: powershell
+        run: |
+          $apkPath = $null
+
+          if ("${{ vars.USE_PREBUILT_APK }}" -eq "true") {
+            $apkPath = "$env:RESOLVED_APK_PATH"
+          } else {
+            $apk = Get-ChildItem -Path . -Recurse -Filter '*.apk' |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+
+            if ($apk) {
+              $apkPath = $apk.FullName
+            }
+          }
+
+          if (-not $apkPath) {
+            Write-Error "APK file not found."
+            exit 1
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $apkPath).Hash.ToLowerInvariant()
+
+          "apk_path=$apkPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "apk_sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          Write-Host "Resolved APK: $apkPath"
+          Write-Host "APK SHA256: $hash"
+
+      - name: Optionally purge existing MobSF record for same APK hash
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $enabled = ($env:MOBSF_DELETE_BEFORE_SCAN + '').Trim().ToLowerInvariant()
+
+          if ([string]::IsNullOrWhiteSpace($enabled)) {
+            $enabled = 'true'
+          }
+
+          if ($enabled -notin @('1', 'true', 'yes', 'y', 'on')) {
+            Write-Host 'MobSF purge disabled.'
+            exit 0
+          }
+
+          Write-Host 'MobSF purge enabled.'
+
+          $baseUrl = ($env:MOBSF_BASE_URL + '').Trim()
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+            $baseUrl = 'http://localhost:8000'
+          }
+          $baseUrl = $baseUrl.TrimEnd('/')
+
+          $deleteEndpoint = ($env:MOBSF_DELETE_ENDPOINT + '').Trim()
+          if ([string]::IsNullOrWhiteSpace($deleteEndpoint)) {
+            $deleteEndpoint = "$baseUrl/api/v1/delete_scan"
+          }
+
+          $hash = "${{ steps.locate_apk.outputs.apk_sha256 }}"
+          if ([string]::IsNullOrWhiteSpace($hash)) {
+            Write-Host 'No local APK hash available. Skipping MobSF purge.'
+            exit 0
+          }
+
+          $apiKey = $env:MOBSF_API_KEY
+          Write-Host "Attempting optional MobSF purge via $deleteEndpoint for hash $hash"
+
+          try {
+            $resp = Invoke-RestMethod -Uri $deleteEndpoint `
+              -Method Post -TimeoutSec 3000 `
+              -Headers @{ Authorization = $apiKey } `
+              -Body @{ hash = $hash }
+
+            if ($resp) {
+              $resp | ConvertTo-Json -Depth 50 | Set-Content mobsf_delete_response.json
+              Write-Host 'MobSF purge request completed.'
+            } else {
+              Write-Host 'MobSF purge request returned an empty response.'
+            }
+          } catch {
+            Write-Host "MobSF purge request failed or endpoint is unsupported: $($_.Exception.Message)"
+          }
+
+      - name: Upload app to MobSF and run static scan
+        id: static_scan
+        env:
+          MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $apkPath = "${{ steps.locate_apk.outputs.apk_path }}"
+          if (-not $apkPath) {
+            Write-Error "APK path not available."
+            exit 1
+          }
+
+          $apiKey  = $env:MOBSF_API_KEY
+          $baseUrl = ($env:MOBSF_BASE_URL + '').Trim()
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+            $baseUrl = 'http://localhost:8000'
+          }
+          $baseUrl = $baseUrl.TrimEnd('/')
+
+          $uploadResult = curl.exe -s -X POST "$baseUrl/api/v1/upload" `
+            -H "Authorization: $apiKey" `
+            -F "file=@$apkPath"
+
+          $uploadResponse = $uploadResult | ConvertFrom-Json
+          $hash = $uploadResponse.hash
+          if (-not $hash) { Write-Error "No hash returned from upload."; exit 1 }
+          Write-Host "Static scan hash: $hash"
+
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Invoke-RestMethod -Uri "$baseUrl/api/v1/scan" `
+            -Method Post -TimeoutSec 3000 `
+            -Headers @{ Authorization = $apiKey } `
+            -Body @{ hash = $hash } | Out-Null
+
+          $report = Invoke-RestMethod -Uri "$baseUrl/api/v1/report_json" `
+            -Method Post -TimeoutSec 3000 `
+            -Headers @{ Authorization = $apiKey } `
+            -Body @{ hash = $hash }
+
+          $report | ConvertTo-Json -Depth 100 | Set-Content mobsf_results.json
+
+      - name: Write scan metadata
+        shell: powershell
+        run: |
+          $metadata = [ordered]@{
+            repository = "${{ github.repository }}"
+            ref = "${{ github.ref }}"
+            sha = "${{ github.sha }}"
+            run_id = "${{ github.run_id }}"
+            run_number = "${{ github.run_number }}"
+            run_attempt = "${{ github.run_attempt }}"
+            build_outcome = "${{ steps.build_app.outcome }}"
+            apk_path = "${{ steps.locate_apk.outputs.apk_path }}"
+            apk_sha256 = "${{ steps.locate_apk.outputs.apk_sha256 }}"
+            mobsf_hash = "${{ steps.static_scan.outputs.hash }}"
+            generated_at_utc = [DateTime]::UtcNow.ToString('o')
+          }
+          $metadata | ConvertTo-Json -Depth 20 | Set-Content mobsf_scan_metadata.json
+
+      - name: Upload MobSF static results
+        uses: actions/upload-artifact@v6
+        with:
+          name: mobsf-report
+          path: |
+            mobsf_results.json
+            mobsf_scan_metadata.json
+          if-no-files-found: error
+
+      - name: Try to download MobSF dynamic JSON report if available
+        if: ${{ steps.static_scan.outputs.hash != '' }}
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $baseUrl = ($env:MOBSF_BASE_URL + '').Trim()
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+            $baseUrl = 'http://localhost:8000'
+          }
+          $baseUrl = $baseUrl.TrimEnd('/')
+
+          $apiKey = $env:MOBSF_API_KEY
+          $hash = "${{ steps.static_scan.outputs.hash }}"
+
+          if (-not $hash) {
+            Write-Host 'No hash from static scan; skipping dynamic report fetch.'
+            exit 0
+          }
+
+          Write-Host "Dynamic scan hash: $hash"
+
+          try {
+            Invoke-RestMethod -Uri "$baseUrl/api/v1/dynamic/stop_analysis" `
+              -Method Post -TimeoutSec 3000 `
+              -Headers @{ Authorization = $apiKey } `
+              -Body @{ hash = $hash } | Out-Null
+          } catch {
+            Write-Host "stop_analysis not needed or not available: $($_.Exception.Message)"
+          }
+
+          try {
+            $dyn = Invoke-RestMethod -Uri "$baseUrl/api/v1/dynamic/report_json" `
+              -Method Post -TimeoutSec 3000 `
+              -Headers @{ Authorization = $apiKey } `
+              -Body @{ hash = $hash }
+
+            if ($dyn) {
+              $dyn | ConvertTo-Json -Depth 100 | Set-Content mobsf_dynamic_results.json
+              Write-Host 'Dynamic report saved to mobsf_dynamic_results.json'
+            } else {
+              Write-Host 'Dynamic report not available.'
+            }
+          } catch {
+            Write-Host "Dynamic report fetch failed: $($_.Exception.Message)"
+          }
+
+      - name: Upload MobSF dynamic results if present
+        uses: actions/upload-artifact@v6
+        with:
+          name: mobsf-dynamic-report
+          path: mobsf_dynamic_results.json
+          if-no-files-found: ignore
+
+      - name: Cleanup release keystore
+        if: always()
+        shell: powershell
+        run: |
+          $keystorePath = Join-Path $env:GITHUB_WORKSPACE 'release.keystore'
+          if (Test-Path $keystorePath) {
+            Remove-Item $keystorePath -Force
+            Write-Host 'release.keystore removed.'
+          }

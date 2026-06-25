@@ -1,0 +1,63 @@
+name: VISION360 Generator (local-only)
+
+on:
+  workflow_call:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  vision360_generator:
+    name: VISION360 generator (local-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare /mnt/data
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/data
+          sudo chmod 777 /mnt/data
+
+      - name: Download all artifacts from this workflow run
+        uses: actions/download-artifact@v5
+        with:
+          path: _artifacts
+          merge-multiple: true
+
+      - name: Normalize inputs for VISION360 (build the 5 required ZIPs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/ci_prepare_vision360_inputs.py --artifacts-dir _artifacts --out-dir /mnt/data
+          ls -lah /mnt/data
+
+      - name: Run VISION360 generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/vision360_generator.py
+
+      - name: Upload VISION360 outputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: vision360-bundle
+          if-no-files-found: error
+          path: |
+            /mnt/data/vision360_fingerprint.json
+            /mnt/data/vision360_output.json

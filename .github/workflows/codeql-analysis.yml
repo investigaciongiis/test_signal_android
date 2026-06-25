@@ -1,0 +1,121 @@
+name: Static SAST (CodeQL)
+
+on:
+  workflow_call:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  sast:
+    name: SAST no build security-only report-only
+    if: ${{ github.actor != 'dependabot[bot]' && !startsWith(github.head_ref || github.ref_name || '', 'dependabot/') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java
+          build-mode: none
+          config-file: .github/codeql/codeql-security.yml
+
+      - name: Perform CodeQL Analysis
+        if: ${{ vars.ENABLE_CODE_SCANNING_UPLOAD == 'true' }}
+        uses: github/codeql-action/analyze@v4
+        with:
+          output: report/codeql
+          upload: false
+        continue-on-error: true
+
+      - name: Set up JDK for Detekt CLI
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ vars.JAVA_VERSION || '11' }}
+
+      - name: Download detekt CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          curl -L -o tools/detekt-cli.jar https://github.com/detekt/detekt/releases/download/v1.23.8/detekt-cli-1.23.8-all.jar
+
+      - name: Run detekt Kotlin to SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          java -jar tools/detekt-cli.jar -i . --all-rules --report sarif:report/detekt.sarif || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install Semgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --upgrade semgrep
+
+      - name: Run Semgrep security packs to SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          semgrep scan \
+            --config p/owasp-top-ten \
+            --config p/security-audit \
+            --config p/secrets \
+            --severity WARNING --severity ERROR \
+            --sarif --output report/semgrep.raw.sarif || true
+
+      - name: Filter Semgrep SARIF keep app code only
+        uses: advanced-security/filter-sarif@v1
+        with:
+          input: report/semgrep.raw.sarif
+          output: report/semgrep.sarif
+          patterns: |
+            -**/test/**
+            -**/androidTest/**
+            -**/*Test*.kt
+            -**/*Test*.java
+            **/src/**
+
+      - name: Ensure jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Merge SARIFs CodeQL Detekt Semgrep
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p report
+          files=(report/codeql/*.sarif report/detekt.sarif report/semgrep.sarif)
+          if [ ${#files[@]} -gt 0 ]; then
+            jq -s '{ "version":"2.1.0", "runs": (map(.runs) | add) }' "${files[@]}" > report/merged.sarif
+          else
+            echo '{ "version":"2.1.0", "runs": [] }' > report/merged.sarif
+          fi
+
+      - name: Upload findings artifact para otros jobs IA
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sast-findings
+          path: |
+            report/*.sarif
+            report/codeql/*.sarif
+          if-no-files-found: warn

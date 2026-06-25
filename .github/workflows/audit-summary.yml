@@ -1,0 +1,163 @@
+name: Audit Summary (Stage 1 + Stage 2)
+
+on:
+  workflow_call:
+    secrets:
+      LLM_API_KEY:
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  audit_summary_analysis_pack:
+    name: Audit Summary Stage 1 -> analysis pack JSON
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare /mnt/data
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/data
+          sudo chmod 777 /mnt/data
+
+      - name: Download security-audit-excel artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: security-audit-excel
+          path: /mnt/data
+
+      - name: Verify Excel input
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "/mnt/data/security_audit_requirements.xlsx"
+          ls -lah "/mnt/data/security_audit_requirements.xlsx"
+
+      - name: Install dependencies stage 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir pandas openpyxl
+
+      - name: Build analysis pack JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/audit_summary_stage1_build_analysis_pack.py
+          test -f "/mnt/data/audit_summary_analysis_pack.json"
+
+      - name: Upload analysis pack artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: audit-summary-analysis-pack
+          if-no-files-found: error
+          path: /mnt/data/audit_summary_analysis_pack.json
+
+  audit_summary_docx:
+    name: Audit Summary Stage 2 -> DOCX PDF ZIP
+    needs: [audit_summary_analysis_pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare /mnt/data
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/data
+          sudo chmod 777 /mnt/data
+
+      - name: Download analysis pack artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: audit-summary-analysis-pack
+          path: /mnt/data
+
+      - name: Download security-audit-excel artifact for trace reference
+        uses: actions/download-artifact@v6
+        with:
+          name: security-audit-excel
+          path: /mnt/data
+
+      - name: Install dependencies stage 2
+        shell: bash
+        env:
+          MPLCONFIGDIR: /tmp/matplotlib
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir pandas openpyxl python-docx matplotlib "openai>=1.55.0"
+          mkdir -p /tmp/matplotlib
+
+      - name: Generate Audit Summary DOCX
+        shell: bash
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_REASONING_EFFORT: "medium"
+          LLM_MAX_OUTPUT_TOKENS: "6000"
+          MPLCONFIGDIR: /tmp/matplotlib
+        run: |
+          set -euo pipefail
+          python scripts/audit_summary_stage2_generate_docx.py
+          test -f "/mnt/data/Audit Summary.docx"
+
+      - name: Install LibreOffice and zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libreoffice zip
+
+      - name: Convert DOCX to PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          libreoffice --headless --convert-to pdf --outdir /mnt/data "/mnt/data/Audit Summary.docx"
+          test -f "/mnt/data/Audit Summary.pdf"
+
+      - name: Create ZIP bundle with DOCX and PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /mnt/data
+          zip -j "audit-summary-bundle.zip" "Audit Summary.docx" "Audit Summary.pdf"
+          test -f "/mnt/data/audit-summary-bundle.zip"
+
+      - name: Upload Audit Summary outputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: audit-summary-zip
+          if-no-files-found: error
+          path: |
+            /mnt/data/Audit Summary.docx
+            /mnt/data/Audit Summary.pdf

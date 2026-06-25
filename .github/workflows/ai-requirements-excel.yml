@@ -1,0 +1,124 @@
+name: AI Requirements Audit (Excel)
+
+on:
+  workflow_call:
+    secrets:
+      LLM_API_KEY:
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ai_requirements_excel:
+    name: AI audit -> security_audit_requirements.xlsx
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare /mnt/data
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/data
+          sudo chmod 777 /mnt/data
+
+      - name: Download VISION360 bundle artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: vision360-bundle
+          path: _vision360_bundle
+
+      - name: Ensure inputs at mandatory paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "scripts/requirements.json"
+
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          src = Path("scripts/requirements.json")
+          dst = Path("/mnt/data/requirements.json")
+          raw = src.read_text(encoding="utf-8", errors="replace")
+
+          s = raw.lstrip()
+          if s.startswith("{{"):
+              raw = raw.replace("{{", "{", 1)
+
+          try:
+              data = json.loads(raw)
+          except json.JSONDecodeError as e:
+              if "Extra data" in e.msg:
+                  raw2 = raw[:e.pos].rstrip()
+                  data = json.loads(raw2)
+              else:
+                  raise
+
+          if isinstance(data, dict) and isinstance(data.get("requirements"), list):
+              data = data["requirements"]
+
+          if not isinstance(data, list):
+              print("requirements.json must be a JSON array.", file=sys.stderr)
+              raise SystemExit(1)
+
+          dst.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+          PY
+
+          if [ -f "_vision360_bundle/vision360_fingerprint.json" ]; then
+            cp "_vision360_bundle/vision360_fingerprint.json" "/mnt/data/vision360_fingerprint.json"
+          elif [ -f "_vision360_bundle/vision360_bundle.zip" ]; then
+            unzip -o "_vision360_bundle/vision360_bundle.zip" -d "/mnt/data" >/dev/null
+          else
+            echo "vision360_fingerprint.json or vision360_bundle.zip not found in vision360-bundle."
+            ls -lahR _vision360_bundle || true
+            exit 1
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir openpyxl "openai>=1.55.0" pydantic
+
+      - name: Run AI audit (creates Excel)
+        env:
+          USE_OPENAI_JUSTIFICATIONS: "0"
+          STRICT_ENGLISH_OUTPUT: "1"
+          TRANSLATE_REQUIREMENT_DESCRIPTIONS: "1"
+
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_REASONING_EFFORT: "low"
+          LLM_MAX_OUTPUT_TOKENS: "5000"
+          LLM_BATCH_SIZE: "20"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/ai_security_audit_requirements_excel.py
+          test -f /mnt/data/security_audit_requirements.xlsx
+
+      - name: Upload Excel output
+        uses: actions/upload-artifact@v6
+        with:
+          name: security-audit-excel
+          if-no-files-found: error
+          path: /mnt/data/security_audit_requirements.xlsx

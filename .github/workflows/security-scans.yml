@@ -1,0 +1,231 @@
+name: Security Scans (Trivy → artifact JSON)
+
+on:
+  workflow_call:
+
+jobs:
+  trivy-scan:
+    name: Trivy File System Scan (genera payload para IA)
+    if: ${{ github.actor != 'dependabot[bot]' && !startsWith(github.head_ref || github.ref_name || '', 'dependabot/') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Android SDK
+        if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false'}}
+        continue-on-error: true
+        uses: android-actions/setup-android@v2
+
+      - name: Detect Android SDK requirements
+        id: android_sdk
+        if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_VERSION=""
+          BUILD_TOOLS_VERSION=""
+
+          if [ -f "cdv-gradle-config.json" ]; then
+            SDK_VERSION=$(python - <<'PY'
+          import json
+          with open("cdv-gradle-config.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          print(data.get("SDK_VERSION", ""))
+          PY
+          )
+                BUILD_TOOLS_VERSION=$(python - <<'PY'
+          import json
+          with open("cdv-gradle-config.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          print(data.get("MIN_BUILD_TOOLS_VERSION", ""))
+          PY
+          )
+          fi
+
+          if [ -z "$SDK_VERSION" ]; then
+            SDK_VERSION=$(grep -RhoE 'compileSdkVersion[[:space:]]+[0-9]+|compileSdk[[:space:]]*=[[:space:]]*[0-9]+' . \
+              | grep -oE '[0-9]+' | head -n1 || true)
+          fi
+
+          if [ -z "$BUILD_TOOLS_VERSION" ]; then
+            BUILD_TOOLS_VERSION=$(grep -RhoE 'buildToolsVersion[[:space:]]+["'\''][0-9.]+["'\'']|buildToolsVersion[[:space:]]*=[[:space:]]*["'\''][0-9.]+["'\'']' . \
+              | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)
+          fi
+
+          # 3) Defaults if still missing
+          SDK_VERSION="${SDK_VERSION:-30}"
+          BUILD_TOOLS_VERSION="${BUILD_TOOLS_VERSION:-30.0.3}"
+
+          echo "sdk_version=$SDK_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_tools_version=$BUILD_TOOLS_VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Detected SDK_VERSION=$SDK_VERSION"
+          echo "Detected BUILD_TOOLS_VERSION=$BUILD_TOOLS_VERSION"
+
+      - name: Install required Android build tools
+        if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false'}}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${{ steps.android_sdk.outputs.sdk_version }}" \
+            "build-tools;${{ steps.android_sdk.outputs.build_tools_version }}"
+
+      - name: Generate Gradle lockfile (no build)
+        if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false' && hashFiles('**/gradle.lockfile') == '' }}
+        continue-on-error: true
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ vars.JAVA_VERSION || '11' }}
+
+      - name: Write Gradle dependency locks
+        if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false' && hashFiles('**/gradle.lockfile') == '' }}
+        continue-on-error: true
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew dependencies --write-locks
+          fi
+
+      - name: Install Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_Linux-64bit.deb
+          sudo dpkg -i trivy_0.69.3_Linux-64bit.deb
+          trivy --version
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v5
+        with:
+          path: .cache/trivy
+          key: ${{ runner.os }}-trivydb-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-trivydb-
+
+      - name: Run Trivy vulnerability scanner (JSON)
+        shell: bash
+        env:
+          TRIVY_CACHE_DIR: .cache/trivy
+          TRIVY_NO_PROGRESS: 'true'
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/trivy
+          trivy fs \
+            --scanners vuln \
+            --vuln-type library \
+            --format json \
+            --output trivy.json \
+            --exit-code 0 \
+            .
+
+      - name: Collect meta
+        id: meta
+        shell: bash
+        run: |
+          echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          trivy_version=$(trivy --version 2>/dev/null | head -n1 | awk '{print $2}')
+          echo "trivy_version=${trivy_version:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build AI payload (agent_payload.json)
+        shell: bash
+        run: |
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ steps.meta.outputs.run_url }}" \
+            --arg trivy_version "${{ steps.meta.outputs.trivy_version }}" \
+            --arg ts "$NOW" \
+            --slurpfile trivy trivy.json \
+            'def ensure_results: ($trivy[0].Results // []);
+             def to_findings:
+               ( ensure_results
+                 | map(. as $r
+                     | ($r.Vulnerabilities // [])
+                     | map({
+                         target: $r.Target,
+                         class:  $r.Class,
+                         type:   $r.Type,
+                         id: .VulnerabilityID,
+                         pkg: .PkgName,
+                         installed: .InstalledVersion,
+                         fixed: (.FixedVersion // null),
+                         fix_available: ( has("FixedVersion") and (.FixedVersion != null) and (.FixedVersion != "") ),
+                         severity: .Severity,
+                         severity_source: .SeveritySource,
+                         vendor_severity: (.VendorSeverity // {}),
+                         cvss: ((.CVSS // {}) | to_entries
+                                | map({source: .key,
+                                       v2: (.value.V2Score // null),
+                                       v2_vector: (.value.V2Vector // null),
+                                       v3: (.value.V3Score // null),
+                                       v3_vector: (.value.V3Vector // null)})),
+                         best_cvss:
+                           (((.CVSS // {}) | to_entries
+                             | map({source: .key,
+                                    v3: (.value.V3Score // 0),
+                                    v3_vector: (.value.V3Vector // null)})
+                             | sort_by(-.v3) | .[0]) // {}),
+                         cwe: (.CWEIDs // []),
+                         title: .Title,
+                         description: (.Description // null),
+                         references: (.References // []),
+                         published: (.PublishedDate // null),
+                         modified: (.LastModifiedDate // null),
+                         data_source: (.DataSource // {})
+                       })
+                   )
+                 | add // [] );
+             def sev_init: {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0,"UNKNOWN":0};
+             def summarize($f):
+               {
+                 total: ($f | length),
+                 by_severity: (reduce $f[] as $x (sev_init; .[$x.severity] += 1)),
+                 fixable: {
+                   total: ($f | map(select(.fix_available)) | length),
+                   by_severity: (reduce ($f | map(select(.fix_available))[]) as $x (sev_init; .[$x.severity] += 1))
+                 },
+                 unique_vulns: ($f | map(.id) | unique | length),
+                 packages_affected: ($f | map(.pkg) | unique | length),
+                 highest_cvss_v3: ($f | map(.best_cvss.v3 // 0) | max // 0),
+                 top_packages: (
+                   $f | group_by(.pkg) | map({pkg: .[0].pkg, count: length}) | sort_by(-.count) | .[:10]
+                 )
+               };
+             (to_findings) as $F
+             |
+             {
+               meta: { repo: $repo, sha: $sha, ref: $ref, run_id: $run_id, run_url: $run_url, generated_at: $ts },
+               scan: { tool: "trivy", tool_version: $trivy_version, mode: "fs", schema: "custom:v2" },
+               summary: summarize($F),
+               findings: $F
+             }' > agent_payload.json
+
+      - name: Upload artifact (payload para IA)
+        uses: actions/upload-artifact@v6
+        with:
+          name: trivy-payload
+          path: |
+            agent_payload.json
+            trivy.json
+          retention-days: 14
+          
