@@ -65,7 +65,7 @@ jobs:
           test -f "/mnt/data/audit_summary_analysis_pack.json"
 
       - name: Upload analysis pack artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: audit-summary-analysis-pack
           if-no-files-found: error
@@ -154,7 +154,7 @@ jobs:
           test -f "/mnt/data/audit-summary-bundle.zip"
 
       - name: Upload Audit Summary outputs
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: audit-summary-zip
           if-no-files-found: error
