@@ -33,7 +33,7 @@ jobs:
           git config --global --get core.longpaths
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Detect Gradle version
         id: gradle
