@@ -38,7 +38,7 @@ jobs:
           sudo chmod 777 /mnt/data
 
       - name: Download security-audit-excel artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: security-audit-excel
           path: /mnt/data
@@ -96,13 +96,13 @@ jobs:
           sudo chmod 777 /mnt/data
 
       - name: Download analysis pack artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: audit-summary-analysis-pack
           path: /mnt/data
 
       - name: Download security-audit-excel artifact for trace reference
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: security-audit-excel
           path: /mnt/data
