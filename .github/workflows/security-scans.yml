@@ -20,7 +20,7 @@ jobs:
       - name: Setup Android SDK
         if: ${{ vars.ENABLE_GRADLE_LOCKFILE_GENERATION != 'false'}}
         continue-on-error: true
-        uses: android-actions/setup-android@v2
+        uses: android-actions/setup-android@v4
 
       - name: Detect Android SDK requirements
         id: android_sdk
