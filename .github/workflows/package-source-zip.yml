@@ -27,7 +27,7 @@ jobs:
           zip -r app.zip . -x ".git/*" ".git/**"
 
       - name: Upload app.zip artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: app-zip
           path: app.zip
