@@ -143,7 +143,7 @@ androidx-core-telecom = { module = "androidx.core:core-telecom", version.ref = "
 androidx-documentfile = "androidx.documentfile:documentfile:1.0.1"
 androidx-credentials = "androidx.credentials:credentials:1.6.0"
 androidx-credentials-compat = "androidx.credentials:credentials-play-services-auth:1.6.0"
-android-billing = "com.android.billingclient:billing-ktx:8.3.0"
+android-billing = "com.android.billingclient:billing-ktx:9.1.0"
 
 # Billing
 material-material = "com.google.android.material:material:1.12.0"
